@@ -63,3 +63,11 @@ Specify if directory names in the completion menu should include a trailing slas
 _Default:_ returns the current working directory of the current buffer
 
 Specifies the base directory for relative paths.
+
+## Testing
+
+Run the cmdline special path regression spec in headless Neovim:
+
+```sh
+XDG_STATE_HOME=/tmp nvim --appimage-extract-and-run --headless -u NONE -i NONE --cmd "set rtp+=." -c "lua dofile('tests/cmdline_special_spec.lua')" -c "qa"
+```

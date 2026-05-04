@@ -1,6 +1,7 @@
 local cmp = require 'cmp'
 
 local NAME_REGEX = '\\%([^/\\\\:\\*?<>\'"`\\|]\\)'
+local NAME_REGEX_CMDLINE = '\\%([^[:space:]/\\\\:\\*?<>\'"`\\|]\\)'
 local PATH_REGEX = vim.regex(([[\%(\%(/PAT*[^/\\\\:\\*?<>\'"`\\| .~]\)\|\%(/\.\.\)\)*/\zePAT*$]]):gsub('PAT', NAME_REGEX))
 
 local source = {}
@@ -32,11 +33,22 @@ source.get_trigger_characters = function()
 end
 
 source.get_keyword_pattern = function(self, params)
+  if vim.api.nvim_get_mode().mode == 'c' then
+    return NAME_REGEX_CMDLINE .. '*'
+  end
   return NAME_REGEX .. '*'
 end
 
 source.complete = function(self, params, callback)
   local option = self:_validate_option(params)
+  local is_cmdline = vim.api.nvim_get_mode().mode == 'c'
+
+  if is_cmdline then
+    local cmdline_special_candidates = self:_cmdline_special_candidates(params, option)
+    if cmdline_special_candidates then
+      return callback(cmdline_special_candidates)
+    end
+  end
 
   local dirname = self:_dirname(params, option)
   if not dirname then
@@ -65,7 +77,148 @@ source.resolve = function(self, completion_item, callback)
   callback(completion_item)
 end
 
+source._has_cmdline_special = function(_, text)
+  local i = 1
+  while i <= #text do
+    local c = string.sub(text, i, i)
+    local escaped = i > 1 and string.sub(text, i - 1, i - 1) == '\\'
+    if not escaped then
+      if c == '%' or c == '#' then
+        return true
+      end
+      if c == '<' and string.find(text, '>', i + 1, true) then
+        return true
+      end
+    end
+    i = i + 1
+  end
+  return false
+end
+
+source._expand_cmdline_special_dirname = function(self, cursor_before_line)
+  local path_expr = string.match(cursor_before_line, '%S+$')
+  if not path_expr then
+    return nil
+  end
+
+  local slash_pos = path_expr:find('/[^/]*$')
+  if not slash_pos then
+    return nil
+  end
+
+  local dirname_expr = string.sub(path_expr, 1, slash_pos)
+  if not self:_has_cmdline_special(dirname_expr) then
+    return nil
+  end
+
+  local expanded = vim.fn.expandcmd(dirname_expr)
+  if expanded == '' then
+    return nil
+  end
+  expanded = expanded:gsub('\\ ', ' ')
+  expanded = vim.fn.fnamemodify(expanded, ':p')
+  return vim.fn.resolve(expanded)
+end
+
+source._cmdline_special_candidates = function(self, params, option)
+  local cursor_before_line = params.context.cursor_before_line
+  local path_expr = string.match(cursor_before_line, '%S+$')
+  if not path_expr then
+    return nil
+  end
+
+  if path_expr:find('/') then
+    return nil
+  end
+
+  if not self:_has_cmdline_special(path_expr) then
+    return nil
+  end
+
+  local matched = vim.fn.getcompletion(path_expr, 'file')
+  if #matched == 0 then
+    return nil
+  end
+
+  local token_start = #cursor_before_line - #path_expr + 1
+  local cursor = params.context.cursor
+  local has_cursor = cursor and cursor.row and cursor.col
+  local text_edit_line = has_cursor and (cursor.row - 1) or 0
+  local text_edit_end_character = has_cursor and (cursor.col - 1) or 0
+
+  local items = {}
+  for _, match in ipairs(matched) do
+    local resolved_match = match:gsub('\\ ', ' ')
+    local normalized_match = resolved_match
+    if normalized_match:sub(1, #path_expr) == path_expr then
+      normalized_match = normalized_match:sub(#path_expr + 1)
+    end
+    if normalized_match == '' then
+      normalized_match = resolved_match
+    end
+
+    local resolved_path = vim.fn.resolve(vim.fn.fnamemodify(normalized_match, ':p'))
+    local stat = vim.loop.fs_stat(resolved_path)
+    local insert_text = normalized_match
+    local item = {
+      label = normalized_match,
+      filterText = path_expr,
+      insertText = insert_text,
+      kind = cmp.lsp.CompletionItemKind.File,
+      data = {
+        path = resolved_path,
+        type = stat and stat.type or 'file',
+        stat = stat,
+        lstat = nil,
+      },
+    }
+
+    if stat and stat.type == 'directory' then
+      local directory = normalized_match
+      if not directory:match('/$') then
+        directory = directory .. '/'
+      end
+
+      item.kind = cmp.lsp.CompletionItemKind.Folder
+      item.label = option.label_trailing_slash and directory or directory:sub(1, -2)
+      insert_text = option.trailing_slash and directory or directory:sub(1, -2)
+      item.insertText = insert_text
+      if not option.trailing_slash then
+        item.word = directory:sub(1, -2)
+      end
+    end
+
+    if has_cursor then
+      item.textEdit = {
+        newText = insert_text,
+        range = {
+          start = {
+            line = text_edit_line,
+            character = token_start - 1,
+          },
+          ['end'] = {
+            line = text_edit_line,
+            character = text_edit_end_character,
+          },
+        },
+      }
+    end
+
+    table.insert(items, item)
+  end
+
+  return items
+end
+
 source._dirname = function(self, params, option)
+  local is_cmdline = vim.api.nvim_get_mode().mode == 'c'
+  if is_cmdline then
+    local expanded = self:_expand_cmdline_special_dirname(params.context.cursor_before_line)
+    if expanded then
+      return expanded
+    end
+  end
+
   local s = PATH_REGEX:match_str(params.context.cursor_before_line)
   if not s then
     return nil
@@ -75,7 +228,7 @@ source._dirname = function(self, params, option)
   local prefix = string.sub(params.context.cursor_before_line, 1, s + 1) -- include '/'
 
   local buf_dirname = option.get_cwd(params)
-  if vim.api.nvim_get_mode().mode == 'c' then
+  if is_cmdline then
     buf_dirname = vim.fn.getcwd()
   end
   if prefix:match('%.%./$') then
